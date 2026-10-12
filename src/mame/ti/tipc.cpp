@@ -141,7 +141,13 @@ private:
 	uint8_t m_blink_count;
 	int m_vsync;
 
+	static constexpr int ROM_WAIT_STATES = 2;
+	static constexpr int IO_WAIT_STATES = 1;
+
 	floppy_image_device *m_floppy = nullptr;
+
+	memory_passthrough_handler m_rom_wait_tap;
+	memory_passthrough_handler m_io_wait_r_tap, m_io_wait_w_tap;
 };
 
 
@@ -162,6 +168,34 @@ void tipc_state::machine_start()
 
 	m_crtc_ram = make_unique_clear<uint8_t[]>(2048);
 	m_crtc_attr = make_unique_clear<uint8_t[]>(2048);
+
+	// The ROM HAL (U28) adds a wait state to every ROM access and to every
+	// CPU I/O access (manual p. 2-20/2-21, Table 2-6 and "I/O Wait States").
+	// Opcode fetches go through the same taps, so code running from ROM is
+	// slowed down too.  The i86 core does not model the 8088 prefetch queue,
+	// so each opcode byte it fetches stands in for more than one real bus
+	// cycle; ROM_WAIT_STATES is therefore an effective per-access penalty
+	// (2 clocks) chosen so LOOP from ROM takes ~21 clocks, which is what the
+	// POST PIT test (F400:A366, table at F400:A2F8) requires.
+	address_space &program = m_maincpu->space(AS_PROGRAM);
+	address_space &io = m_maincpu->space(AS_IO);
+	m_rom_wait_tap = program.install_read_tap(0xfc000, 0xfffff, "rom_wait",
+			[this] (offs_t offset, u8 &data, u8 mem_mask)
+			{
+				if (!machine().side_effects_disabled())
+					m_maincpu->adjust_icount(-ROM_WAIT_STATES);
+			}, &m_rom_wait_tap);
+	m_io_wait_r_tap = io.install_read_tap(0x0000, 0xffff, "io_wait_r",
+			[this] (offs_t offset, u8 &data, u8 mem_mask)
+			{
+				if (!machine().side_effects_disabled())
+					m_maincpu->adjust_icount(-IO_WAIT_STATES);
+			}, &m_io_wait_r_tap);
+	m_io_wait_w_tap = io.install_write_tap(0x0000, 0xffff, "io_wait_w",
+			[this] (offs_t offset, u8 &data, u8 mem_mask)
+			{
+				m_maincpu->adjust_icount(-IO_WAIT_STATES);
+			}, &m_io_wait_w_tap);
 
 	m_loopback.allocate(720, 400);
 	m_loopback.fill(0);
