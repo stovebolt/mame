@@ -6,7 +6,7 @@
 
     to do:
 
-    - native keyboard (not dumped)
+    - keyboard MCU not dumped (HLE in tipc_kbd.cpp)
     - attribute blink rate is a guess (not given in TechRef)
     - diags: pass all tests (interrupt test depends on timing of LOOP insn)
     - sound
@@ -19,7 +19,8 @@
 
 #include "emu.h"
 
-#include "bus/rs232/rs232.h"
+#include "tipc_kbd.h"
+
 #include "cpu/i86/i86.h"
 #include "imagedev/floppy.h"
 #include "machine/clock.h"
@@ -57,7 +58,7 @@ public:
 		, m_upd8251(*this, "upd8251")
 		, m_pit8253(*this, "pit8253")
 		, m_pic8259(*this, "pic8259")
-		, m_rs232(*this, "rs232")
+		, m_kbd(*this, "kbd")
 		, m_irq2_merger(*this, "merge_irq2")
 		, m_irq3_merger(*this, "merge_irq3")
 		, m_ram(*this, RAM_TAG)
@@ -117,7 +118,7 @@ private:
 	required_device<i8251_device> m_upd8251;
 	required_device<pit8253_device> m_pit8253;
 	required_device<pic8259_device>  m_pic8259;
-	required_device<rs232_port_device> m_rs232;
+	required_device<tipc_keyboard_device> m_kbd;
 	required_device<input_merger_all_high_device> m_irq2_merger;
 	required_device<input_merger_all_high_device> m_irq3_merger;
 	required_device<ram_device> m_ram;
@@ -151,12 +152,6 @@ private:
 };
 
 
-static DEVICE_INPUT_DEFAULTS_START( kbd_rs232_defaults )
-	DEVICE_INPUT_DEFAULTS( "RS232_TXBAUD", 0xff, RS232_BAUD_2400 )
-	DEVICE_INPUT_DEFAULTS( "RS232_DATABITS", 0xff, RS232_DATABITS_8 )
-	DEVICE_INPUT_DEFAULTS( "RS232_PARITY", 0xff, RS232_PARITY_EVEN )
-	DEVICE_INPUT_DEFAULTS( "RS232_STOPBITS", 0xff, RS232_STOPBITS_1 )
-DEVICE_INPUT_DEFAULTS_END
 
 void tipc_state::machine_start()
 {
@@ -610,21 +605,20 @@ void tipc_state::tipc(machine_config &config)
 	m_maincpu->set_irq_acknowledge_callback(m_pic8259, FUNC(pic8259_device::inta_cb));
 
 	I8251(config, m_upd8251);
-	m_upd8251->txd_handler().set(m_rs232, FUNC(rs232_port_device::write_txd));
+	m_upd8251->txd_handler().set(m_kbd, FUNC(tipc_keyboard_device::rxd_w));
 	m_upd8251->txd_handler().append(m_upd8251, FUNC(i8251_device::write_dsr)); // keyboard loops back tx to dsr
 	m_upd8251->dtr_handler().set_inputline(m_maincpu, INPUT_LINE_NMI).invert();
 	m_upd8251->rxrdy_handler().set(m_pic8259, FUNC(pic8259_device::ir7_w));
 	m_upd8251->txrdy_handler().set(m_pic8259, FUNC(pic8259_device::ir7_w));
 
-	RS232_PORT(config, m_rs232, default_rs232_devices, "keyboard"); // FIXME
-	m_rs232->rxd_handler().set(m_upd8251, FUNC(i8251_device::write_rxd));
-	m_rs232->cts_handler().set(m_upd8251, FUNC(i8251_device::write_cts));
-	m_rs232->set_option_device_input_defaults("keyboard", DEVICE_INPUT_DEFAULTS_NAME(kbd_rs232_defaults));
+	TIPC_KEYBOARD(config, m_kbd);
+	m_kbd->txd_handler().set(m_upd8251, FUNC(i8251_device::write_rxd));
+	m_kbd->cts_handler().set(m_upd8251, FUNC(i8251_device::write_cts));
 
-	clock_device &keyboard_tx_clock(CLOCK(config, "keyboard_tx_clock", XTAL(15'000'000) / (3 * 256))); // 300
+	clock_device &keyboard_tx_clock(CLOCK(config, "keyboard_tx_clock", XTAL(15'000'000) / (3 * 256))); // 305 baud at x64
 	keyboard_tx_clock.signal_handler().set(m_upd8251, FUNC(i8251_device::write_txc));
 
-	clock_device &keyboard_rx_clock(CLOCK(config, "keyboard_rx_clock", XTAL(15'000'000) / (3 * 32))); // 2400
+	clock_device &keyboard_rx_clock(CLOCK(config, "keyboard_rx_clock", XTAL(15'000'000) / (3 * 32))); // 2441 baud at x64
 	keyboard_rx_clock.signal_handler().set(m_upd8251, FUNC(i8251_device::write_rxc));
 
 	PIT8253(config, m_pit8253);
