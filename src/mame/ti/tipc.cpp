@@ -110,6 +110,10 @@ private:
 	void misc_w(offs_t offset, uint8_t data);
 
 	void palette_w(offs_t offset, uint8_t data);
+	void usart_w(offs_t offset, uint8_t data);
+	void usart_rxrdy_w(int state);
+	void usart_txrdy_w(int state);
+	void usart_update_irq();
 
 	void vsync_changed(int state);
 
@@ -136,6 +140,8 @@ private:
 	uint16_t m_buf_ptr;
 	std::unique_ptr<uint8_t[]> m_buf;
 
+	bool m_usart_rxrdy = false, m_usart_txrdy = false;
+	bool m_usart_masked = false, m_usart_mode_next = true;
 	uint8_t m_crtc_attr_latch, m_crtc_misc_latch, m_crtc_misc_buffer, m_crtc_palette[3];
 	std::unique_ptr<uint8_t[]> m_crtc_ram, m_crtc_attr;
 	bitmap_ind8 m_loopback;     // 3-bit BRG color of each displayed pixel, for DF000 readback
@@ -200,6 +206,10 @@ void tipc_state::machine_start()
 	save_item(NAME(m_crtc_misc_latch));
 	save_item(NAME(m_crtc_misc_buffer));
 	save_item(NAME(m_crtc_palette));
+	save_item(NAME(m_usart_rxrdy));
+	save_item(NAME(m_usart_txrdy));
+	save_item(NAME(m_usart_masked));
+	save_item(NAME(m_usart_mode_next));
 	save_item(NAME(m_blink_count));
 	save_item(NAME(m_vsync));
 	save_pointer(NAME(m_crtc_ram), 2048);
@@ -218,6 +228,10 @@ void tipc_state::machine_reset()
 	m_blink_count = 0;
 	m_vsync = 0;
 	m_maincpu->set_input_line(INPUT_LINE_NMI, CLEAR_LINE);
+
+	m_usart_masked = false;
+	m_usart_mode_next = true;
+	usart_update_irq();
 }
 
 
@@ -425,6 +439,57 @@ uint8_t tipc_state::misc_r(offs_t offset)
 	return 0xf0 | m_crtc_misc_buffer | color;
 }
 
+/*
+ * Keyboard USART (U44) control writes
+ *
+ * On a real 8251A an Internal Reset command (bit 6) idles the transmitter and
+ * receiver until a new command is written, so TxRDY/RxRDY drop.  MAME's i8251
+ * keeps the previous command's TxEN, leaving TxRDY asserted.  IR7 is level
+ * triggered here, so while Diagnostics 1.60 re-initialises the USART
+ * (65 25 65 7F 30) the ROM keyboard ISR runs continuously; its 34H command
+ * interleaves with the sequence, 7FH then lands as a command with DTR set and
+ * DTR raises NMI (TechRef p. 2-21), giving "System Error 1040" or a hang.
+ * Mask the keyboard interrupt from an Internal Reset until a command enables
+ * the transmitter or receiver again.  Only asynchronous mode is tracked; the
+ * TIPC never uses sync mode.
+ */
+void tipc_state::usart_w(offs_t offset, uint8_t data)
+{
+	if (offset & 1)
+	{
+		if (m_usart_mode_next)
+			m_usart_mode_next = false;
+		else if (BIT(data, 6))
+		{
+			m_usart_mode_next = true;
+			m_usart_masked = true;
+		}
+		else if (data & 0x05)
+			m_usart_masked = false;
+	}
+
+	m_upd8251->write(offset, data);
+	usart_update_irq();
+}
+
+void tipc_state::usart_rxrdy_w(int state)
+{
+	m_usart_rxrdy = state;
+	usart_update_irq();
+}
+
+void tipc_state::usart_txrdy_w(int state)
+{
+	m_usart_txrdy = state;
+	usart_update_irq();
+}
+
+// RxRDY and TxRDY are ORed onto IR7 (TechRef p. 2-10); the 8087 also shares
+// this line but is not emulated
+void tipc_state::usart_update_irq()
+{
+	m_pic8259->ir7_w(!m_usart_masked && (m_usart_rxrdy || m_usart_txrdy));
+}
 
 // 0=blue, 1=green, 2=red
 void tipc_state::palette_w(offs_t offset, uint8_t data)
@@ -590,7 +655,7 @@ void tipc_state::tipc_io(address_map &map)
 	map(0x0002, 0x0002).nopw(); // U49 latch (printer data)
 	map(0x0003, 0x0003).nopw(); // U50 latch (printer, leds)
 	map(0x0004, 0x0004).w(FUNC(tipc_state::u51_w));
-	map(0x0010, 0x0011).rw(m_upd8251, FUNC(i8251_device::read), FUNC(i8251_device::write));
+	map(0x0010, 0x0011).r(m_upd8251, FUNC(i8251_device::read)).w(FUNC(tipc_state::usart_w));
 	map(0x0014, 0x0017).rw(m_pit8253, FUNC(pit8253_device::read), FUNC(pit8253_device::write));
 	map(0x0018, 0x0019).rw(m_pic8259, FUNC(pic8259_device::read), FUNC(pic8259_device::write));
 	map(0x0020, 0x0023).rw(FUNC(tipc_state::fdc_r), FUNC(tipc_state::fdc_w));
@@ -608,8 +673,8 @@ void tipc_state::tipc(machine_config &config)
 	m_upd8251->txd_handler().set(m_kbd, FUNC(tipc_keyboard_device::rxd_w));
 	m_upd8251->txd_handler().append(m_upd8251, FUNC(i8251_device::write_dsr)); // keyboard loops back tx to dsr
 	m_upd8251->dtr_handler().set_inputline(m_maincpu, INPUT_LINE_NMI).invert();
-	m_upd8251->rxrdy_handler().set(m_pic8259, FUNC(pic8259_device::ir7_w));
-	m_upd8251->txrdy_handler().set(m_pic8259, FUNC(pic8259_device::ir7_w));
+	m_upd8251->rxrdy_handler().set(FUNC(tipc_state::usart_rxrdy_w));
+	m_upd8251->txrdy_handler().set(FUNC(tipc_state::usart_txrdy_w));
 
 	TIPC_KEYBOARD(config, m_kbd);
 	m_kbd->txd_handler().set(m_upd8251, FUNC(i8251_device::write_rxd));
