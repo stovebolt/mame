@@ -290,6 +290,17 @@ void tipc_state::u51_w(uint8_t data)
 		m_floppies[0]->get_device()->mon_w(BIT(data, 4));
 	if (m_floppies[1]->get_device())
 		m_floppies[1]->get_device()->mon_w(BIT(data, 5));
+
+	// FDC READY follows the selected drive's motor enable rather than a
+	// drive-generated ready signal (inferred from Diagnostics 1.60 FLOTST:
+	// expects READY immediately after motor-on + ~0.2 s, and NOT READY
+	// while the motor is off; error 0603/0606 otherwise).  MAME's drive
+	// ready needs two index pulses after spin-up, which also caused the
+	// transient "Disk error reading drive A" after long diag tests.
+	bool motor = false;
+	if ((data & 3) == 1) motor = !BIT(data, 4);
+	if ((data & 3) == 2) motor = !BIT(data, 5);
+	m_fdc->set_force_ready(motor);
 }
 
 void tipc_state::fdc_w(offs_t offset, uint8_t data)
