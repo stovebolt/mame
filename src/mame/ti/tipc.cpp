@@ -373,7 +373,7 @@ void tipc_state::fdc_drq_w(int state)
 		break;
 
 	default:
-		LOGDISK("unexpected drq in mode %d\n");
+		LOGDISK("unexpected drq in mode %d\n", m_buf_mode);
 		break;
 	}
 }

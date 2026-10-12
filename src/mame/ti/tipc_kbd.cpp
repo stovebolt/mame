@@ -36,6 +36,9 @@
 
 #include "machine/keyboard.ipp"
 
+//#define VERBOSE 1
+#include "logmacro.h"
+
 
 DEFINE_DEVICE_TYPE(TIPC_KEYBOARD, tipc_keyboard_device, "tipc_kbd", "TI Professional Computer Keyboard")
 
@@ -298,7 +301,7 @@ TIMER_CALLBACK_MEMBER(tipc_keyboard_device::respond)
 		break;
 
 	default: // unknown commands are ignored, the system unit retries
-		logerror("unknown command %02X\n", m_command);
+		LOG("unknown command %02X\n", m_command);
 		break;
 	}
 }
