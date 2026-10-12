@@ -735,7 +735,11 @@ void tipc_state::tipc(machine_config &config)
 	m_crtc->out_vsync_callback().set(FUNC(tipc_state::vsync_changed));
 
 	/* internal ram */
-	RAM(config, RAM_TAG).set_default_size("256K").set_extra_options("512K, 768K");
+	// 64K motherboard + 64K/128K/192K memory-connector board, then one or two
+	// 256K expansion-bus boards at 40000-7FFFF and 80000-BFFFF (TechRef pp. 1-3,
+	// 2-20, 3-1; memory map B-1).  Unpopulated space is open bus so the ROM
+	// memory sizing finds the end of RAM.
+	RAM(config, RAM_TAG).set_default_size("256K").set_extra_options("64K, 128K, 192K, 512K, 768K");
 }
 
 ROM_START(tipc)
