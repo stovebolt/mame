@@ -626,6 +626,7 @@ static void pc_dd_floppies(device_slot_interface &device)
 {
 	device.option_add("525dd", FLOPPY_525_DD);
 	device.option_add("525qd", FLOPPY_525_QD);
+	device.option_add("35dd", FLOPPY_35_DD);    // 80-track 720K, needs E3-E4 (+E1-E2)
 }
 
 static INPUT_PORTS_START(tipc)
@@ -633,10 +634,13 @@ static INPUT_PORTS_START(tipc)
 	PORT_DIPNAME( 0x04, 0x04, "Monitor type")
 	PORT_DIPSETTING(    0x00, "50 Hz" )
 	PORT_DIPSETTING(    0x04, "60 Hz" )
+	// U48 option jumpers, read inverted on port 01 (TechRef pp. 2-13, 2-32, 4-14):
+	// E1-E2 = drive A double-sided, E3-E4 = drive A 80 tracks.
 	PORT_DIPNAME( 0x03, 0x02, "Floppy type")
-	PORT_DIPSETTING(    0x01, "640 KB DSQD" )
-	PORT_DIPSETTING(    0x02, "320 KB DSDD" )
-	PORT_DIPSETTING(    0x03, "160 KB SSDD" )
+	PORT_DIPSETTING(    0x03, "Single-sided 40 track (no jumpers)" )
+	PORT_DIPSETTING(    0x02, "Double-sided 40 track (E1-E2)" )
+	PORT_DIPSETTING(    0x01, "80 track (E3-E4)" )
+	PORT_DIPSETTING(    0x00, "Double-sided 80 track (E1-E2 + E3-E4)" )
 INPUT_PORTS_END
 
 void tipc_state::tipc_map(address_map &map)
