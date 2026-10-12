@@ -7,7 +7,7 @@
     to do:
 
     - native keyboard (not dumped)
-    - cursor blink rate, blink attr
+    - attribute blink rate is a guess (not given in TechRef)
     - diags: pass all tests (interrupt test depends on timing of LOOP insn)
     - sound
     - printer
@@ -61,6 +61,7 @@ public:
 		, m_irq2_merger(*this, "merge_irq2")
 		, m_irq3_merger(*this, "merge_irq3")
 		, m_ram(*this, RAM_TAG)
+		, m_screen(*this, "screen")
 		, m_crtc(*this, "crtc")
 		, m_palette(*this, "palette")
 		, m_vdu_char_rom(*this, "vduchar")
@@ -120,6 +121,7 @@ private:
 	required_device<input_merger_all_high_device> m_irq2_merger;
 	required_device<input_merger_all_high_device> m_irq3_merger;
 	required_device<ram_device> m_ram;
+	required_device<screen_device> m_screen;
 	required_device<sy6545_1_device> m_crtc;
 	required_device<palette_device> m_palette;
 	required_region_ptr<u8> m_vdu_char_rom;
@@ -135,6 +137,9 @@ private:
 
 	uint8_t m_crtc_attr_latch, m_crtc_misc_latch, m_crtc_misc_buffer, m_crtc_palette[3];
 	std::unique_ptr<uint8_t[]> m_crtc_ram, m_crtc_attr;
+	bitmap_ind8 m_loopback;     // 3-bit BRG color of each displayed pixel, for DF000 readback
+	uint8_t m_blink_count;
+	int m_vsync;
 
 	floppy_image_device *m_floppy = nullptr;
 };
@@ -157,6 +162,19 @@ void tipc_state::machine_start()
 
 	m_crtc_ram = make_unique_clear<uint8_t[]>(2048);
 	m_crtc_attr = make_unique_clear<uint8_t[]>(2048);
+
+	m_loopback.allocate(720, 400);
+	m_loopback.fill(0);
+
+	save_item(NAME(m_u47));
+	save_item(NAME(m_crtc_attr_latch));
+	save_item(NAME(m_crtc_misc_latch));
+	save_item(NAME(m_crtc_misc_buffer));
+	save_item(NAME(m_crtc_palette));
+	save_item(NAME(m_blink_count));
+	save_item(NAME(m_vsync));
+	save_pointer(NAME(m_crtc_ram), 2048);
+	save_pointer(NAME(m_crtc_attr), 2048);
 }
 
 void tipc_state::machine_reset()
@@ -168,6 +186,9 @@ void tipc_state::machine_reset()
 
 	m_u47 = 0;
 	m_crtc_attr_latch = m_crtc_misc_latch = m_crtc_misc_buffer = 0;
+	m_blink_count = 0;
+	m_vsync = 0;
+	m_maincpu->set_input_line(INPUT_LINE_NMI, CLEAR_LINE);
 }
 
 
@@ -327,30 +348,54 @@ uint8_t tipc_state::attr_r(offs_t offset)
 }
 
 /*
- * TechRef pp. 2-51, B-2
+ * Miscellaneous output latch, TechRef pp. 2-51, 2-56, B-2
  *
- * b7 - interrupt enable
+ * b7 - CRT interrupt enable
  * b6 - text screen enable
  * b5 - undocumented
+ *
+ * p. 2-56: "To enable this interrupt, set the interrupt enable bit in the
+ * miscellaneous latch to high.  Vertical blanking causes the CPU nonmaskable
+ * interrupt, and the interrupt pending bit is set. ... To reset the interrupt,
+ * set the interrupt enable bit to low."
  */
 void tipc_state::misc_w(offs_t offset, uint8_t data)
 {
 	m_crtc_misc_latch = data;
-	m_crtc_misc_buffer &= ~(1 << 3);
-	m_crtc_misc_buffer |= BIT(data, 7) << 3;
+
+	if (!BIT(data, 7))
+	{
+		// clearing the enable resets the pending flip-flop and releases NMI
+		m_crtc_misc_buffer &= ~(1 << 3);
+		m_maincpu->set_input_line(INPUT_LINE_NMI, CLEAR_LINE);
+	}
 }
 
 /*
- * Bits 0-2 loop back color outputs (TechRef p. 2-56)
+ * Miscellaneous input buffer, TechRef pp. 2-51, 2-56, B-1
+ *
+ * b0-b2 - blue, red, green video outputs looped back (diagnostic, p. 2-56)
+ * b3    - CRT interrupt pending
  *
  * Self test expects values 0xf0 and 0xf7 (ROM listing p. 90)
  */
 uint8_t tipc_state::misc_r(offs_t offset)
 {
-	m_crtc_misc_buffer ^= 7;
-	LOG("crtc misc buf %02x\n", 0xf0 | m_crtc_misc_buffer);
-	return 0xf0 | m_crtc_misc_buffer;
+	uint8_t color = 0;
+
+	if (!machine().side_effects_disabled())
+		m_screen->update_now();
+
+	int const y = m_screen->vpos();
+	int const x = m_screen->hpos();
+
+	// outside the active area the outputs are blanked (black)
+	if (m_screen->visible_area().contains(x, y) && y < m_loopback.height() && x < m_loopback.width())
+		color = m_loopback.pix(y, x) & 7;
+
+	return 0xf0 | m_crtc_misc_buffer | color;
 }
+
 
 // 0=blue, 1=green, 2=red
 void tipc_state::palette_w(offs_t offset, uint8_t data)
@@ -360,8 +405,18 @@ void tipc_state::palette_w(offs_t offset, uint8_t data)
 
 void tipc_state::vsync_changed(int state)
 {
-	m_maincpu->set_input_line(INPUT_LINE_NMI, state & BIT(m_crtc_misc_latch, 7));
-	if (BIT(m_crtc_misc_latch, 7)) m_crtc_misc_buffer |= state << 3;
+	if (state && !m_vsync)
+	{
+		m_blink_count++;
+
+		// pending bit is latched on vertical blanking and held until cleared via misc_w
+		if (BIT(m_crtc_misc_latch, 7))
+		{
+			m_crtc_misc_buffer |= 1 << 3;
+			m_maincpu->set_input_line(INPUT_LINE_NMI, ASSERT_LINE);
+		}
+	}
+	m_vsync = state;
 }
 
 /*
@@ -383,6 +438,11 @@ void tipc_state::vsync_changed(int state)
  * character enable
  * blink
  * underline
+ *
+ * cursor and reverse video affect the entire 9x12 cell (p. 2-52); cursor
+ * shape and blink come from 6545 R10/R11, handled by the mc6845 device.
+ * Blink rate for the blink attribute is not given in TechRef; assumed to
+ * toggle every 32 fields (~0.94 Hz at 60 Hz), the 6545 "slow" rate.
  */
 MC6845_UPDATE_ROW(tipc_state::crtc_update_row)
 {
@@ -403,6 +463,8 @@ MC6845_UPDATE_ROW(tipc_state::crtc_update_row)
 			color = BIT(m_crtc_palette[0], color) | (BIT(m_crtc_palette[2], color) << 1) | (BIT(m_crtc_palette[1], color) << 2);
 
 			bitmap.pix(y, x) = pen[color];
+			if (y < m_loopback.height() && x < m_loopback.width())
+				m_loopback.pix(y, x) = color;
 
 			code_0 <<= 1;
 			code_1 <<= 1;
@@ -420,28 +482,30 @@ MC6845_UPDATE_ROW(tipc_state::crtc_update_row)
 		if (BIT(data, 8))
 			data = bitswap<9>(data, 7, 7, 6, 5, 4, 3, 2, 1, 1);
 
-		if (column == cursor_x)
-		{
-			data = 0x1ff;
-		}
-
 		// underline
 		if (BIT(attr, 5) && ra == 11) data = 0x1ff;
 
-		// blink TODO
+		// blink: character and underline go off together (p. 2-55)
+		if (BIT(attr, 6) && BIT(m_blink_count, 5)) data = 0;
 
-		// character enable
+		// character enable: no character, underline or blink (p. 2-55)
 		if (!BIT(attr, 3)) data = 0;
 
-		// reverse video
+		// reverse video and cursor rank above character enable (p. 2-55)
 		if (BIT(attr, 4)) data ^= 0x1ff;
+		if (column == cursor_x) data ^= 0x1ff;
 
 		for (int bit = 0; bit < 9; bit++)
 		{
 			int x = (column * 9) + bit;
 			int color = (de && BIT(data, 8)) ? (attr & 7) : 0;
 
-			if (color) bitmap.pix(y, x) = pen[color];
+			if (color)
+			{
+				bitmap.pix(y, x) = pen[color];
+				if (y < m_loopback.height() && x < m_loopback.width())
+					m_loopback.pix(y, x) = color;
+			}
 
 			data <<= 1;
 		}
@@ -552,9 +616,9 @@ void tipc_state::tipc(machine_config &config)
 
 	// CRT Controller board
 
-	screen_device &screen(SCREEN(config, "screen"));
-	screen.set_raw(XTAL(18'000'000), 936, 0, 720, 320, 0, 300);
-	screen.set_screen_update("crtc", FUNC(mc6845_device::screen_update));
+	SCREEN(config, m_screen);
+	m_screen->set_raw(XTAL(18'000'000), 936, 0, 720, 320, 0, 300);
+	m_screen->set_screen_update("crtc", FUNC(mc6845_device::screen_update));
 
 	PALETTE(config, m_palette, palette_device::BRG_3BIT);
 
