@@ -35,6 +35,7 @@
 #include "video/mc6845.h"
 
 #include "emupal.h"
+#include "speaker.h"
 #include "screen.h"
 
 
@@ -57,6 +58,7 @@ public:
 		, m_dsw0(*this, "DSW0")
 		, m_upd8251(*this, "upd8251")
 		, m_pit8253(*this, "pit8253")
+		, m_speaker(*this, "speaker")
 		, m_pic8259(*this, "pic8259")
 		, m_kbd(*this, "kbd")
 		, m_irq2_merger(*this, "merge_irq2")
@@ -121,6 +123,10 @@ private:
 	required_ioport m_dsw0;
 	required_device<i8251_device> m_upd8251;
 	required_device<pit8253_device> m_pit8253;
+	required_device<speaker_sound_device> m_speaker;
+	int m_spken = 0, m_pit_out0 = 0;
+	void pit_out0_w(int state);
+	void speaker_update() { m_speaker->level_w(m_spken & m_pit_out0); }
 	required_device<pic8259_device>  m_pic8259;
 	required_device<tipc_keyboard_device> m_kbd;
 	required_device<input_merger_all_high_device> m_irq2_merger;
@@ -203,6 +209,8 @@ void tipc_state::machine_start()
 
 	save_item(NAME(m_u47));
 	save_item(NAME(m_crtc_attr_latch));
+	save_item(NAME(m_spken));
+	save_item(NAME(m_pit_out0));
 	save_item(NAME(m_crtc_misc_latch));
 	save_item(NAME(m_crtc_misc_buffer));
 	save_item(NAME(m_crtc_palette));
@@ -234,10 +242,23 @@ void tipc_state::machine_reset()
 	usart_update_irq();
 }
 
+void tipc_state::pit_out0_w(int state)
+{
+	m_pit_out0 = state;
+	speaker_update();
+}
+
 
 void tipc_state::u47_w(uint8_t data)
 {
-	m_pit8253->write_gate0(BIT(data, 0)); // FIXME replace with input merger?
+	// SPKEN, TechRef p. 2-18: gates the 1.25 MHz speaker timer clock so tones
+	// can be interrupted without reprogramming the timer.  The ROM (INT 48H
+	// F400:AB55-AB80) programs counter 0 in mode 3 once, then only toggles this
+	// bit.  Modeled as GATE0 (stops/restarts the square wave) plus an AND on
+	// the speaker line, so "off" is always silent rather than a stuck level.
+	m_spken = BIT(data, 0);
+	m_pit8253->write_gate0(m_spken);
+	speaker_update();
 
 	m_irq3_merger->in_w<1>(BIT(data, 1));
 	m_irq2_merger->in_w<1>(BIT(data, 2));
@@ -703,6 +724,11 @@ void tipc_state::tipc(machine_config &config)
 
 	PIT8253(config, m_pit8253);
 	m_pit8253->set_clk<0>(XTAL(15'000'000) / (3 * 4)); // speaker
+	m_pit8253->out_handler<0>().set(FUNC(tipc_state::pit_out0_w));
+
+	// LM386 amplifier driving a 9-ohm speaker, TechRef p. 2-18
+	SPEAKER(config, "mono").front_center();
+	SPEAKER_SOUND(config, m_speaker).add_route(ALL_OUTPUTS, "mono", 0.50);
 	m_pit8253->set_clk<1>(XTAL(15'000'000) / (3 * 8)); // timer A
 	m_pit8253->out_handler<1>().set(m_irq3_merger, FUNC(input_merger_all_high_device::in_w<0>)).invert();
 	m_pit8253->out_handler<1>().append(m_irq3_merger, FUNC(input_merger_all_high_device::in_w<2>)).invert();
@@ -762,4 +788,4 @@ ROM_END
 
 
 //    YEAR  NAME     PARENT   COMPAT  MACHINE  INPUT     CLASS        INIT        COMPANY              FULLNAME                 FLAGS
-COMP( 1983, tipc,    0,       0,      tipc,    tipc,     tipc_state,  empty_init, "Texas Instruments", "Professional Computer", MACHINE_NOT_WORKING | MACHINE_NO_SOUND)
+COMP( 1983, tipc,    0,       0,      tipc,    tipc,     tipc_state,  empty_init, "Texas Instruments", "Professional Computer", MACHINE_NOT_WORKING)
